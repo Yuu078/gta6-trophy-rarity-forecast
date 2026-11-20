@@ -22,15 +22,18 @@
 //      time counts half, and the total move from the last read is capped
 //      at 2.5 logit units, so a short or noisy history cannot fling the
 //      median somewhere absurd.
-//   4. With a single distinct observation there is no trend to fit. Then the
-//      honest forecast is a dilution prior: the next Exophase refresh folds
-//      in a wave of new players who have earned far fewer trophies, so the
-//      median sits below the last rate and the spread is wide enough to
-//      cover the refresh landing either side of it.
-//   5. Spread: a random-walk term (0.5 logit per sqrt day, as the house
-//      baseline), the fit's residual and leverage, and a refresh term for
-//      refreshes the case has not seen yet — combined in quadrature, floored
-//      and capped so the 90% band stays honest without exploding.
+//   4. With a single distinct observation there is no trend to fit. Then
+//      the honest forecast is a dilution prior: the next Exophase refresh
+//      folds in a wave of new players who have earned far fewer trophies,
+//      so the median sits below the last rate and the spread is wide
+//      enough to cover the refresh landing either side of it. The prior
+//      is calibrated per trophy category (categoryOf): story trophies a
+//      launch crowd earns first dilute least, collectible and grind
+//      trophies most.
+//   5. Spread: a random-walk term (per-category, logit per sqrt day), the
+//      fit's residual and leverage, and a refresh term for refreshes the
+//      case has not seen yet — combined in quadrature, floored and capped
+//      so the 90% band stays honest without exploding.
 //
 // Node 22, standard library only. Deterministic: no clock, no randomness,
 // inputs read in name order, outputs rounded to 4 decimals.
@@ -56,9 +59,66 @@ const FLAT_SHIFT = -0.7;
 /** Spread (logit) when the history holds a single distinct read. */
 const FLAT_SIGMA = 1.3;
 
+/**
+ * Per-category calibration (the A/B variant). A trophy's category comes
+ * from the case's own data — name, description, tier and its last observed
+ * rate (see categoryOf) — never from a hardcoded id list, so the final
+ * case's own trophy list is categorised the same way. Story trophies a
+ * launch crowd earns first dilute least (their earners keep pace with the
+ * growing player pool); collectible and grind trophies dilute most (a
+ * fresh cohort has barely touched them) and are the least predictable.
+ */
+type Category = 'early' | 'mid' | 'grind';
+/** Median shift (logit) of the single-observation prior, per category. */
+const SHIFT_BY_CATEGORY: Record<Category, number> = {
+  early: -0.3,
+  mid: -0.7,
+  grind: -1.2,
+};
+/** Random-walk spread (logit per sqrt day), per category. */
+const SIGMA_BY_CATEGORY: Record<Category, number> = {
+  early: 0.3,
+  mid: 0.6,
+  grind: 1.0,
+};
+
 interface Trophy {
   id: number;
   tier: string;
+  name: string;
+  description: string;
+}
+
+/**
+ * Categorise one trophy from the case data alone. Rules, in order:
+ * platinum and 100%-completion are the grind of grinds; "Complete
+ * Chapter N" is main story (N <= 2 early, later chapters late); "Complete
+ * the final mission." ends the main story; a trophy every tracked player
+ * already holds is the game's opening beat; repetition markers (all /
+ * every / a count of locations / a count attached to an action) mark
+ * collectible and grind trophies; anything else is a side trophy, which
+ * shares the late-story parameters.
+ */
+function categoryOf(t: Trophy, lastRate: number): Category {
+  const desc = t.description ?? '';
+  if (t.tier === 'platinum' || desc.includes('100% Completion')) {
+    return 'grind';
+  }
+  const chapter = desc.match(/Complete Chapter (\d+)/);
+  if (chapter) return parseInt(chapter[1], 10) <= 2 ? 'early' : 'mid';
+  if (desc.startsWith('Complete the final mission.')) return 'mid';
+  if (lastRate >= 99.9) return 'early';
+  if (/\b(all|every)\b/i.test(desc)) return 'grind';
+  if (/\b\d+\s+locations\b/i.test(desc)) return 'grind';
+  if (
+    /\b\d+\b/.test(desc) &&
+    /Complete|Win|Rob|Discover|Register|Earn|Spend|Purchase|Take down|Meditate|Explore/.test(
+      desc,
+    )
+  ) {
+    return 'grind';
+  }
+  return 'mid';
 }
 
 interface Read {
@@ -104,6 +164,7 @@ function forecastOne(
   lastRate: number,
   targetX: number,
   horizonDays: number,
+  category: Category,
 ): [number, number] {
   const lastLogit = logit(lastRate);
   if (obs.length === 0) return [logit(tierPrior('bronze')), 1.5];
@@ -111,12 +172,18 @@ function forecastOne(
     // No trend exists yet: expect the next refresh to dilute the rate.
     // A trophy sitting at the 100% ceiling has the most dilution exposure
     // in percentage points — a fresh cohort cannot all hold it at once —
-    // so its band is widened further on the logit scale.
+    // so its band is widened further on the logit scale. The median shift
+    // and the walk spread are the trophy category's: story trophies the
+    // crowd earns first dilute least, grind trophies most.
     const flatSigma = lastRate >= 99.9 ? 2.0 : FLAT_SIGMA;
+    const walkSigma = SIGMA_BY_CATEGORY[category];
     const sigma = Math.sqrt(
-      flatSigma * flatSigma + WALK_SIGMA * WALK_SIGMA * horizonDays,
+      flatSigma * flatSigma + walkSigma * walkSigma * horizonDays,
     );
-    return [lastLogit + FLAT_SHIFT, Math.min(2.2, Math.max(0.4, sigma))];
+    return [
+      lastLogit + SHIFT_BY_CATEGORY[category],
+      Math.min(2.2, Math.max(0.4, sigma)),
+    ];
   }
 
   // Least squares of y on x over the distinct observations.
@@ -167,7 +234,7 @@ function forecastOne(
   const leverage =
     1 + 1 / n + (sxx > 1e-12 ? (targetX - xBar) * (targetX - xBar) / sxx : 1);
   const fitSigma = residCapped * Math.sqrt(leverage);
-  const walk = WALK_SIGMA * Math.sqrt(horizonDays);
+  const walk = SIGMA_BY_CATEGORY[category] * Math.sqrt(horizonDays);
   const sigma = Math.sqrt(
     walk * walk + fitSigma * fitSigma + REFRESH_SIGMA * REFRESH_SIGMA,
   );
@@ -221,7 +288,13 @@ for (const file of inputs) {
       );
       return { id: t.id, q: q.sort((a, b) => a - b) };
     }
-    const [median, sigma] = forecastOne(obs, lastRate, targetX, horizonDays);
+    const [median, sigma] = forecastOne(
+      obs,
+      lastRate,
+      targetX,
+      horizonDays,
+      categoryOf(t, lastRate),
+    );
     const q = Z.map((z) => round4(clampRate(invLogit(median + z * sigma))));
     // Enforce non-decreasing after rounding.
     for (let j = 1; j < q.length; j++) {
